@@ -3,4 +3,3 @@ mux-FC360 App.env
 soccer_mux.db
 venv/
 __pycache__/
-.streamlit/
