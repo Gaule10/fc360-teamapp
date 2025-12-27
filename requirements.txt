@@ -1,0 +1,8 @@
+streamlit
+pandas
+mux-python
+python-dotenv
+requests
+sqlalchemy
+chardet
+psycopg2-binary
