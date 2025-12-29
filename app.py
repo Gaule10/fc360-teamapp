@@ -63,15 +63,43 @@ Session = sessionmaker(bind=engine)
 # --- UTILS ---
 def hash_password(password): return hashlib.sha256(str.encode(password)).hexdigest()
 
-def apply_custom_css():
-    st.markdown("""
-        <style>
-        [data-testid="stMetricValue"] { font-size: 24px; color: #00FFCC; }
-        .stButton>button { width: 100%; border-radius: 5px; background-color: #1E1E1E; border: 1px solid #333; transition: 0.3s; }
-        .stButton>button:hover { border-color: #00FFCC; color: #00FFCC; }
-        .clip-card { padding: 10px; background: #111; border-left: 3px solid #00FFCC; margin-bottom: 5px; border-radius: 4px; }
-        </style>
-    """, unsafe_allow_html=True)
+def create_mux_upload():
+    try:
+        api_client = mux_python.ApiClient(configuration)
+        direct_uploads_api = mux_python.DirectUploadsApi(api_client)
+        create_asset_request = mux_python.CreateAssetRequest(playback_policy=[mux_python.PlaybackPolicy.PUBLIC])
+        create_upload_request = mux_python.CreateUploadRequest(new_asset_settings=create_asset_request, cors_origin="*", timeout=3600)
+        upload = direct_uploads_api.create_direct_upload(create_upload_request)
+        return upload.data.url, upload.data.id
+    except Exception as e:
+        st.error(f"Mux Error: {e}"); return None, None
+
+def update_processing_matches():
+    session = Session()
+    processing = session.query(Match).filter(Match.status.in_(['processing', 'uploading'])).all()
+    if not processing: st.toast("All matches synced!"); session.close(); return
+    api_client = mux_python.ApiClient(configuration); uploads_api = mux_python.DirectUploadsApi(api_client); assets_api = mux_python.AssetsApi(api_client)
+    for m in processing:
+        try:
+            up = uploads_api.get_direct_upload(m.mux_asset_id)
+            if up.data.asset_id:
+                asset = assets_api.get_asset(up.data.asset_id)
+                if asset.data.status == 'ready':
+                    m.mux_playback_id = asset.data.playback_ids[0].id
+                    m.status = 'ready'
+        except: continue
+    session.commit(); session.close(); st.rerun()
+
+def parse_xml(xml_bytes):
+    try:
+        root = ET.fromstring(xml_bytes.decode('utf-8', errors='ignore').strip())
+        events = []
+        for instance in root.findall('.//instance'):
+            start = instance.find('start'); end = instance.find('end'); code = instance.find('code'); label = instance.find('.//label/text')
+            if start is not None and end is not None:
+                events.append({'tag': code.text if code is not None else 'Unknown', 'player': label.text if label is not None else '', 'start_ms': int(float(start.text) * 1000), 'end_ms': int(float(end.text) * 1000)})
+        return events
+    except Exception as e: st.error(f"XML Error: {e}"); return []
 
 # --- LOGIN & REGISTRATION ---
 if "authenticated" not in st.session_state:
@@ -84,7 +112,7 @@ if not st.session_state.authenticated:
     db = Session()
     with t1:
         e = st.text_input("Email"); p = st.text_input("Password", type="password")
-        if st.button("Sign In"):
+        if st.button("Sign In", use_container_width=True):
             user = db.query(User).filter(User.email == e, User.password == hash_password(p)).first()
             if user:
                 st.session_state.update({"authenticated": True, "user_id": user.id, "role": user.role})
@@ -92,69 +120,95 @@ if not st.session_state.authenticated:
             else: st.error("Access Denied")
     with t2:
         ne = st.text_input("New Email"); np = st.text_input("New Password", type="password")
-        if st.button("Register as User"):
+        if st.button("Register as User", use_container_width=True):
             try:
-                # Forced role to 'user' - No selection option for security
-                db.add(User(email=ne, password=hash_password(np), role='user'))
+                db.add(User(email=ne, password=hash_password(np), role='user')) # Hardcoded user role
                 db.commit(); st.success("Account created! Go to Login.")
             except: st.error("Email already in use.")
     db.close(); st.stop()
 
-# --- MAIN APP LAYOUT ---
+# --- MAIN APP ---
 st.set_page_config(page_title="FC360 Pro", layout="wide")
-apply_custom_css()
 
 with st.sidebar:
-    st.image("https://via.placeholder.com/150x50.png?text=FC360+PRO", use_container_width=True)
+    st.title("FC360 PRO")
     db = Session()
     u = db.query(User).get(st.session_state.user_id)
-    st.caption(f"Logged in as: {u.email}")
+    st.caption(f"Member: {u.email}")
     st.write(f"Team: **{u.team.name if u.team else 'Free Agent'}**")
     
-    if st.button("Logout"):
+    if st.button("Logout", use_container_width=True):
         st.session_state.authenticated = False; st.rerun()
 
-    # HIDDEN ADMIN SECTION
+    # --- ADMIN SUITE LOGIC ---
     if st.session_state.role == "admin":
         st.divider()
-        if st.toggle("🛠️ Enable Admin Management"):
-            st.subheader("Admin Suite")
-            # Place Admin Match Upload/User Logic here...
-            st.info("Admin mode enabled. Return to User mode for analysis.")
-            # Match upload logic would go here
-            db.close(); st.stop() 
+        admin_mode = st.toggle("🛠️ Enable Admin Management")
+        if admin_mode:
+            st.title("Admin Console")
+            
+            # Match Upload
+            with st.expander("📤 Upload New Match", expanded=True):
+                t_in = st.text_input("Team Name"); opp = st.text_input("Opponent")
+                v_f = st.file_uploader("Video", type=['mp4','mov']); x_f = st.file_uploader("XML", type=['xml'])
+                if st.button("🚀 Start Upload"):
+                    if t_in and v_f and x_f:
+                        u_url, u_id = create_mux_upload()
+                        if u_url:
+                            if requests.put(u_url, data=v_f).status_code == 200:
+                                team = db.query(Team).filter(Team.name == t_in).first() or Team(name=t_in)
+                                if not team.id: db.add(team); db.flush()
+                                match = Match(opponent=opp, team_id=team.id, mux_asset_id=u_id, status='processing')
+                                db.add(match); db.flush()
+                                for ev in parse_xml(x_f.read()): db.add(Event(match_id=match.id, **ev))
+                                db.commit(); st.success("Uploaded! Use Sync Status in 1 min.")
+            
+            if st.button("🔄 Sync Mux Status", use_container_width=True): update_processing_matches()
+            
+            # User Management
+            with st.expander("👥 Assign Teams"):
+                users = db.query(User).filter(User.role == 'user').all()
+                teams = db.query(Team).all()
+                t_list = [t.name for t in teams]
+                for user in users:
+                    col1, col2 = st.columns([2,1])
+                    col1.write(user.email)
+                    target = col2.selectbox("Team", t_list, key=f"u{user.id}")
+                    if col2.button("Apply", key=f"b{user.id}"):
+                        user.team_id = db.query(Team).filter(Team.name == target).first().id
+                        db.commit(); st.rerun()
+            
+            db.close(); st.stop() # Prevents Analysis UI from loading while in Admin Mode
 
 # --- SIDE-BY-SIDE ANALYSIS VIEW ---
-st.title("Performance Analysis")
+st.title("Performance Review Room")
 col_vid, col_events = st.columns([3, 2]) # 60/40 Split
 
 with col_events:
-    st.subheader("Match Events")
-    # Filters
+    st.subheader("Match Timeline")
     tags = db.query(Event.tag).distinct().all()
-    sel_tag = st.selectbox("Filter Action:", ["All Actions"] + sorted([t[0] for t in tags]))
+    sel_tag = st.selectbox("Action Type:", ["All"] + sorted([t[0] for t in tags]))
     
-    # Scrollable Timeline Container
-    with st.container(height=650, border=True):
+    with st.container(height=600, border=True):
         query = db.query(Event, Match).join(Match)
         if u.role != "admin": query = query.filter(Match.team_id == u.team_id)
-        if sel_tag != "All Actions": query = query.filter(Event.tag == sel_tag)
+        if sel_tag != "All": query = query.filter(Event.tag == sel_tag)
         
         for ev, mt in query.all():
             if mt.status == 'ready':
-                st.markdown(f'''<div class="clip-card"><b>{ev.tag}</b><br><small>{ev.player} vs {mt.opponent}</small></div>''', unsafe_allow_html=True)
-                # Video Trigger Button
-                seek = ev.start_ms // 1000
-                v_url = f"https://stream.mux.com/{mt.mux_playback_id}/low.mp4#t={seek}"
-                if st.button(f"Play Clip", key=f"btn_{ev.id}"):
-                    st.session_state.active_video = v_url; st.rerun()
+                with st.container(border=True):
+                    c1, c2 = st.columns([4, 1])
+                    c1.write(f"**{ev.tag}** ({ev.player})")
+                    c1.caption(f"Match vs {mt.opponent}")
+                    if c2.button("▶️", key=f"play_{ev.id}"):
+                        st.session_state.active_video = f"https://stream.mux.com/{mt.mux_playback_id}/low.mp4#t={ev.start_ms//1000}"
+                        st.rerun()
 
 with col_vid:
-    st.subheader("Review Room")
+    st.subheader("Video Analysis")
     if st.session_state.active_video:
         st.video(st.session_state.active_video)
-        st.caption("Press 'L' to skip forward 10s or 'J' to skip back.")
     else:
-        st.image("https://via.placeholder.com/800x450.png?text=Select+a+clip+to+start+analysis")
+        st.info("Select a clip on the right to begin analysis.")
 
 db.close()
